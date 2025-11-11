@@ -1,0 +1,2 @@
+# nkf-bin
+Compiled nkf
