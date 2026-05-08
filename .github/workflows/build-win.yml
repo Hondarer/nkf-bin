@@ -137,13 +137,31 @@ jobs:
           msystem: MINGW64
           install: >-
             make
-            gcc
+            mingw-w64-x86_64-binutils
+            mingw-w64-x86_64-gcc
 
-      - name: Build nkf.exe
+      - name: Build nkf.exe with static linking
         shell: msys2 {0}
         run: |
           cd "${{ steps.source.outputs.source_dir_msys }}"
-          make
+          make clean
+          make \
+            CC=gcc \
+            CFLAGS="-g -O2 -Wall -pedantic" \
+            LDFLAGS="-static -static-libgcc"
+
+      - name: Verify nkf.exe has no extra DLL dependencies
+        shell: msys2 {0}
+        run: |
+          cd "${{ steps.source.outputs.source_dir_msys }}"
+
+          objdump -p nkf.exe | grep "DLL Name:" > dll-deps.txt || true
+          cat dll-deps.txt
+
+          if grep -Eiq 'msys-2\.0\.dll|libgcc_s[^ ]*\.dll|libwinpthread[^ ]*\.dll|libstdc\+\+[^ ]*\.dll' dll-deps.txt; then
+            echo "Unexpected non-system DLL dependency detected."
+            exit 1
+          fi
 
       - name: Collect build output
         shell: pwsh
