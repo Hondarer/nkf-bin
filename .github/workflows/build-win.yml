@@ -174,7 +174,7 @@ jobs:
 
       - name: Check whether a release exists for this tag
         id: release
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           RELEASE_TAG: ${{ steps.meta.outputs.tag }}
         with:
