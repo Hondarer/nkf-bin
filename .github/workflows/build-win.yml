@@ -1,0 +1,214 @@
+name: Build NKF on Windows
+
+on:
+  push:
+    tags:
+      - "*"
+  release:
+    types:
+      - published
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-win-${{ github.event.release.tag_name || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          if ('${{ github.event_name }}' -eq 'release') {
+            $tag = '${{ github.event.release.tag_name }}'
+          }
+          else {
+            $tag = '${{ github.ref_name }}'
+          }
+
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            throw 'Failed to resolve tag name.'
+          }
+
+          $assetName = "nkf-bin-$tag-windows.zip"
+          $sourceUrl = "https://github.com/nurse/nkf/archive/refs/tags/$tag.zip"
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "asset_name=$assetName" >> $env:GITHUB_OUTPUT
+          "source_url=$sourceUrl" >> $env:GITHUB_OUTPUT
+          "default_branch=${{ github.event.repository.default_branch }}" >> $env:GITHUB_OUTPUT
+
+      - name: Prepare workspace
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path .work\download | Out-Null
+          New-Item -ItemType Directory -Force -Path .work\src | Out-Null
+          New-Item -ItemType Directory -Force -Path .work\dist | Out-Null
+
+      - name: Download upstream source archive
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri '${{ steps.meta.outputs.source_url }}' -OutFile .work\download\nkf.zip
+
+      - name: Expand upstream source archive
+        id: source
+        shell: pwsh
+        run: |
+          Expand-Archive -LiteralPath .work\download\nkf.zip -DestinationPath .work\src -Force
+          $sourceDir = Get-ChildItem -LiteralPath .work\src -Directory | Select-Object -First 1
+          if ($null -eq $sourceDir) {
+            throw 'Expanded source directory was not found.'
+          }
+
+          $windowsPath = $sourceDir.FullName
+          $msysPath = '/' + $windowsPath.Substring(0, 1).ToLowerInvariant() + $windowsPath.Substring(2).Replace('\', '/')
+
+          "source_dir=$windowsPath" >> $env:GITHUB_OUTPUT
+          "source_dir_msys=$msysPath" >> $env:GITHUB_OUTPUT
+
+      - name: Generate LICENSE from upstream source
+        shell: pwsh
+        run: |
+          .\scripts\extract-license.ps1 `
+            -SourcePath "${{ steps.source.outputs.source_dir }}\man\nkf.1.pm" `
+            -OutputPath .work\dist\LICENSE.generated
+
+      - name: Sync repository LICENSE
+        id: license
+        shell: pwsh
+        run: |
+          $generated = Join-Path $PWD '.work\dist\LICENSE.generated'
+          $repoLicense = Join-Path $PWD 'LICENSE'
+          $changed = $true
+
+          if (Test-Path -LiteralPath $repoLicense) {
+            $currentText = [System.IO.File]::ReadAllText($repoLicense).Replace("`r`n", "`n")
+            $generatedText = [System.IO.File]::ReadAllText($generated).Replace("`r`n", "`n")
+            $changed = $currentText -ne $generatedText
+          }
+
+          if ($changed) {
+            Copy-Item -LiteralPath $generated -Destination $repoLicense -Force
+          }
+
+          "changed=$($changed.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+      - name: Commit LICENSE update and retag
+        if: steps.license.outputs.changed == 'true'
+        shell: pwsh
+        run: |
+          $defaultBranch = '${{ steps.meta.outputs.default_branch }}'
+          $tag = '${{ steps.meta.outputs.tag }}'
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch origin $defaultBranch --depth=1
+          git checkout -B $defaultBranch origin/$defaultBranch
+          Copy-Item -LiteralPath .work\dist\LICENSE.generated -Destination LICENSE -Force
+          git add LICENSE
+
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host 'LICENSE already matches on the default branch.'
+            exit 0
+          }
+
+          git commit -m "Sync LICENSE from upstream tag $tag"
+          git push origin "HEAD:$defaultBranch"
+
+          $newCommit = (git rev-parse HEAD).Trim()
+          git tag -f $tag $newCommit
+          git push origin "refs/tags/$tag" --force
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          msystem: MINGW64
+          install: >-
+            make
+            gcc
+
+      - name: Build nkf.exe
+        shell: msys2 {0}
+        run: |
+          cd "${{ steps.source.outputs.source_dir_msys }}"
+          make
+
+      - name: Collect build output
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path '${{ steps.source.outputs.source_dir }}' -Recurse -Filter nkf.exe | Select-Object -First 1
+          if ($null -eq $exe) {
+            throw 'Built nkf.exe was not found.'
+          }
+
+          Copy-Item -LiteralPath $exe.FullName -Destination .work\dist\nkf.exe -Force
+          Copy-Item -LiteralPath LICENSE -Destination .work\dist\LICENSE -Force
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          .\.work\dist\nkf.exe --version
+
+      - name: Create release package
+        shell: pwsh
+        run: |
+          if (Test-Path -LiteralPath ".work\\${{ steps.meta.outputs.asset_name }}") {
+            Remove-Item -LiteralPath ".work\\${{ steps.meta.outputs.asset_name }}" -Force
+          }
+
+          Compress-Archive `
+            -LiteralPath .work\dist\nkf.exe, .work\dist\LICENSE `
+            -DestinationPath ".work\${{ steps.meta.outputs.asset_name }}"
+
+      - name: Check whether a release exists for this tag
+        id: release
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        with:
+          script: |
+            const tag = process.env.RELEASE_TAG;
+            if (context.eventName === 'release') {
+              core.setOutput('exists', 'true');
+              return;
+            }
+
+            try {
+              await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag,
+              });
+              core.setOutput('exists', 'true');
+            } catch (error) {
+              if (error.status === 404) {
+                core.setOutput('exists', 'false');
+                return;
+              }
+              throw error;
+            }
+
+      - name: Upload package to GitHub Release
+        if: steps.release.outputs.exists == 'true'
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          artifactErrorsFailBuild: true
+          artifacts: .work/${{ steps.meta.outputs.asset_name }}
+          omitBodyDuringUpdate: true
+          omitNameDuringUpdate: true
+          removeArtifacts: true
+          replacesArtifacts: true
+          tag: ${{ steps.meta.outputs.tag }}
